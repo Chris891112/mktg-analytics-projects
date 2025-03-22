@@ -10,7 +10,7 @@
 # - Basic Multi Regression Model to identify MNU driver
 # - Limitation: this doesn't represent entire channels with complicated customer journey
 
-# The brand team wants to have a comprehensive understanding of why the number of new players in Dead by Daylight has increased.
+# The brand team wants to have a comprehensive understanding of why the number of new players has increased.
 
 # 1) Check overall attributed impact
 # 2) Then consider seasonality
