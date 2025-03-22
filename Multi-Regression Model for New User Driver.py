@@ -51,7 +51,7 @@ pd.set_option('display.max_rows', None)
 
 
 # Load the data
-df = pd.read_csv(r'C:\Users\chan\Desktop\DNU_Daily_Channel.csv')
+df = pd.read_csv(r'C:DNU_Daily_Channel.csv')
 
 
 # In[40]:
