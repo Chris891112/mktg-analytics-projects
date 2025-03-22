@@ -1,0 +1,37 @@
+// For Advanced KPI Scorecards
+// general measure in Power BI
+
+Cumulative Audience = 
+VAR SelectedNetwork = SELECTEDVALUE('Network Parameter'[Network])
+VAR MaxDate = MAX('Sprout-Profile-Update'[Date])
+RETURN
+CALCULATE(
+    SUM('Sprout-Profile-Update'[Audience]),
+    FILTER(
+        'Sprout-Profile-Update',
+        'Sprout-Profile-Update'[Date] = MaxDate
+            && (ISBLANK(SelectedNetwork) || 'Sprout-Profile-Update'[Network] = SelectedNetwork)
+    )
+)
+
+
+// Growth Rate (selected period vs. previous period measure) 
+
+Audience Growth Rate = 
+VAR CurrentAudience = [Cumulative Audience]
+VAR PreviousAudience = [Previous Period Audience]
+VAR GrowthRate = 
+    IF(
+        PreviousAudience = 0,
+        BLANK(),
+        DIVIDE(CurrentAudience - PreviousAudience, PreviousAudience, 0)
+    )
+RETURN
+SWITCH(
+    TRUE(),
+    ISBLANK(GrowthRate), "No Data",
+    GrowthRate > 0, "▲ " & FORMAT(GrowthRate, "0.00%"),  // positive
+    GrowthRate < 0, "▼ " & FORMAT(ABS(GrowthRate), "0.00%"),  // negative
+    "0.00%"  // if 0 then 0!
+)
+  
