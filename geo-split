@@ -1,0 +1,92 @@
+
+colmap = {
+    "Row Labels": "DMA",
+    "Region": "Region",
+    "Urbanicity": "Urbanicity",
+    "Urban/Rural": "Urbanicity",
+    "Sum of DAU": "DAU_Sum",
+    "Sum of TV_HH": "TV_HH",
+    "Sum of Revenue": "Revenue_Sum",
+    "Toss Out": "TossOut",
+}
+df = df.rename(columns={k:v for k,v in colmap.items() if k in df.columns})
+
+# ===== required field =====
+need = ["DMA","Region","Urbanicity","DAU_Sum"]
+missing = [c for c in need if c not in df.columns]
+if missing:
+    raise ValueError(f"no col: {missing}")
+
+# data type
+for c in ["DAU_Sum","TV_HH","Revenue_Sum"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# ===== Toss-out =====
+if "TossOut" in df.columns:
+    mask_toss = df["TossOut"].astype(str).str.strip().str.lower().isin(
+        ["toss out","toss","yes","true","1"]
+    )
+else:
+    mask_toss = pd.Series(False, index=df.index)
+
+toss_list = df.loc[mask_toss, "DMA"].tolist()
+
+# ===== Stratified : DAU Quarter × Region × Urbanicity =====
+pool = df.loc[~mask_toss, ["DMA","Region","Urbanicity","DAU_Sum"]].copy()
+
+# DAU (Q1~Q4)
+pool["DAU_Q"] = pd.qcut(pool["DAU_Sum"].rank(method="first"), 4, labels=["Q1","Q2","Q3","Q4"])
+
+# ===== 80:20 =====
+np.random.seed(SEED)
+parts = []
+for (r,u,q), g in pool.groupby(["Region","Urbanicity","DAU_Q"], dropna=False):
+    n = len(g)
+    if n == 0:
+        continue
+    n_test = max(1, int(round(n * TEST_RATIO)))
+    idx = g.sample(n=n, random_state=SEED).index
+    test_idx = set(idx[:n_test])
+    gg = g.copy()
+    gg["Group"] = ["test" if i in test_idx else "control" for i in g.index]
+    parts.append(gg)
+
+assign = pd.concat(parts).reset_index(drop=True)
+
+# Toss-out 
+toss_df = df.loc[mask_toss, ["DMA","Region","Urbanicity","DAU_Sum"]].copy()
+toss_df["DAU_Q"] = "TOSS"
+toss_df["Group"] = "toss_out"
+
+final_map = pd.concat([assign, toss_df], ignore_index=True)
+
+# ===== QA (Stratified Test/Control  & DAU) =====
+qa_count = final_map.query('Group in ["test","control"]').pivot_table(
+    index=["Region","Urbanicity","DAU_Q"],
+    columns="Group",
+    values="DMA",
+    aggfunc="count",
+    fill_value=0
+).reset_index()
+
+qa_dau = final_map.query('Group in ["test","control"]').pivot_table(
+    index=["Region","Urbanicity","DAU_Q"],
+    columns="Group",
+    values="DAU_Sum",
+    aggfunc="sum",
+    fill_value=0
+).add_prefix("DAU_").reset_index()
+
+qa = qa_count.merge(qa_dau, on=["Region","Urbanicity","DAU_Q"], how="left")
+
+# ===== CSV =====
+out_path = xlsx_path.with_name(xlsx_path.stem + "_with_groups.xlsx")
+with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+    final_map[["DMA","Region","Urbanicity","DAU_Sum","DAU_Q","Group"]].to_excel(
+        writer, sheet_name="Group Mapping", index=False
+    )
+    qa.to_excel(writer, sheet_name="Split Balance QA", index=False)
+
+print("Saved:", out_path)
+print("Toss-out DMAs:", ", ".join(toss_list) if toss_list else "(none)")
