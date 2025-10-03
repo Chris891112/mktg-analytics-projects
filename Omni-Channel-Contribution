@@ -1,0 +1,407 @@
+# adding if needed
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import ttest_ind
+from ipywidgets import SelectMultiple, IntSlider, Checkbox, HBox, VBox, Label, Output
+from IPython.display import display, clear_output
+import seaborn as sns
+
+
+
+import warnings
+warnings.filterwarnings("ignore", module="matplotlib.backends.backend_agg")
+
+# path
+file_path = r"C:\Users\hic01\Desktop\★Astella\OCA Case Study Data Pivot.xlsx"
+
+
+df_web = pd.read_excel(file_path, sheet_name="Web")
+df_clean = pd.read_excel(file_path, sheet_name="CleanFin")
+
+# vendor에 따라 액티비티가 겹쳐서 뉴스레터는 vendor 9라는 점 
+df_clean.info()
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ===================== 1) 원본 데이터에서 전술 분리 =====================
+df_web2 = df_web.copy()
+df_web2[["Website_Type", "Channel"]] = df_web2["Tactic Name"].str.extract(r"^(HCP|Consumer) Branded Website - (.*)$")
+df_web2["Channel"] = df_web2["Channel"].str.strip()
+
+# ===================== 2) 집계 (year-month 단위) =====================
+agg_page = (df_web2
+            .groupby(["year","month","Website_Type","Channel"], as_index=False)
+            .agg(page_views=("page_views","sum"),
+                 time_on_site=("time_on_site","mean"),
+                 max_time_on_site=("max_time_on_site","mean")))
+
+# ===================== 3) 시각화 비교 =====================
+
+# (a) 채널별 page_views vs time_on_site 산점도
+plt.figure(figsize=(10,6))
+sns.scatterplot(data=agg_page, x="page_views", y="time_on_site",
+                hue="Website_Type", style="Channel")
+plt.title("Page Views vs Avg Time on Site (by Channel/Website_Type)")
+plt.xlabel("Page Views")
+plt.ylabel("Avg Time on Site")
+plt.legend(bbox_to_anchor=(1.05,1), loc="upper left")
+plt.show()
+
+# (b) 시계열 트렌드 비교 (page_views vs time_on_site)
+fig, axes = plt.subplots(2,1, figsize=(12,8), sharex=True)
+
+# page_views
+sns.lineplot(data=agg_page, x="month", y="page_views",
+             hue="Channel", style="Website_Type", ax=axes[0])
+axes[0].set_title("Monthly Page Views by Channel")
+axes[0].set_ylabel("Page Views")
+
+# time_on_site
+sns.lineplot(data=agg_page, x="month", y="time_on_site",
+             hue="Channel", style="Website_Type", ax=axes[1])
+axes[1].set_title("Monthly Avg Time on Site by Channel")
+axes[1].set_ylabel("Avg Time on Site (seconds)")
+
+plt.tight_layout()
+plt.show()
+
+# (c) 상관계수 heatmap (page_views vs time_on_site, max_time_on_site)
+corr_df = agg_page[["page_views","time_on_site","max_time_on_site"]].corr()
+plt.figure(figsize=(5,4))
+sns.heatmap(corr_df, annot=True, cmap="coolwarm", fmt=".2f")
+plt.title("Correlation between Web Metrics")
+plt.show()
+
+# one line quick run ver
+
+# ===================== 0) Imports =====================
+import numpy as np, pandas as pd, re, json, warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import train_test_split, KFold, cross_validate
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import make_scorer, mean_squared_error, r2_score
+from sklearn.inspection import permutation_importance
+import shap
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+# ===================== 1) Base =====================
+df = df_clean.copy()
+if "y_log" not in df.columns:
+    df["y_log"] = np.log1p(df["TotalPatients"])
+
+# ===================== 2) CRM(일반 + eNewsletter) 합산 =====================
+def normalize_spaces(s):
+    return re.sub(r"\s+", " ", s.strip()) if isinstance(s, str) else s
+
+norm_cols = {c: normalize_spaces(c) for c in df.columns}
+rev = {}
+for orig, norm in norm_cols.items():
+    rev.setdefault(norm, []).append(orig)
+
+crm_open_names  = ["HCP CRM Email Open","HCP CRM Email  Open","HCP CRM Email eNewsletter Open"]
+crm_click_names = ["HCP CRM Email Click","HCP CRM Email  Click","HCP CRM Email eNewsletter Click"]
+
+def expand_cols(names):
+    out = []
+    for n in names:
+        if n in rev: out += rev[n]
+    return [c for c in out if c in df.columns]
+
+open_cols  = expand_cols(crm_open_names)
+click_cols = expand_cols(crm_click_names)
+
+df["CRM Email Open (Any)"]  = df[open_cols].fillna(0).sum(axis=1)  if open_cols  else 0.0
+df["CRM Email Click (Any)"] = df[click_cols].fillna(0).sum(axis=1) if click_cols else 0.0
+
+# ===================== 3) 웹데이터: HCP/Consumer × Channel → pageviews =====================
+dfw = df_web.copy()
+m = dfw["Tactic Name"].str.extract(r"^(HCP|Consumer) Branded Website\s*-\s*(.*)$")
+dfw["Website_Type"] = m[0].str.strip()
+dfw["Channel_raw"]  = m[1].str.strip()
+
+def norm_channel(s):
+    s = s.lower()
+    if "search" in s:  return "Search"
+    if "display" in s: return "Display"
+    if "social" in s:  return "Social"
+    if "direct" in s:  return "Direct"
+    if "referral" in s:return "Referral"
+    if "email" in s:   return "Email"
+    if "print" in s:   return "Print"
+    return "Other"
+
+dfw["Channel"] = dfw["Channel_raw"].apply(norm_channel)
+
+agg = (dfw.groupby(["year","month","Website_Type","Channel"], as_index=False)
+          .agg(page_views=("page_views","sum")))
+
+web_wide = (agg.pivot_table(index=["year","month"],
+                            columns=["Website_Type","Channel"],
+                            values="page_views",
+                            fill_value=0)
+               .reset_index())
+
+# 컬럼명 정리
+new_cols = ["year","month"]
+for wt, ch in web_wide.columns.tolist()[2:]:
+    new_cols.append(f"{wt}_{ch}_pageviews")
+web_wide.columns = new_cols
+
+# ---- 합계도 만들지만, 모델엔 '구성요소'만 사용할 것 ----
+web_wide["WEB_HCP_Search"]      = web_wide.filter(regex=r"^HCP_.*Search_pageviews$").sum(axis=1)
+web_wide["WEB_Consumer_Search"] = web_wide.filter(regex=r"^Consumer_.*Search_pageviews$").sum(axis=1)
+web_wide["WEB_Display"]         = web_wide.filter(regex=r"_(Display)_pageviews$").sum(axis=1)
+web_wide["WEB_Social"]          = web_wide.filter(regex=r"_(Social)_pageviews$").sum(axis=1)
+web_wide["WEB_Direct"]          = web_wide.filter(regex=r"_(Direct)_pageviews$").sum(axis=1)
+web_wide["WEB_Referral"]        = web_wide.filter(regex=r"_(Referral)_pageviews$").sum(axis=1)
+
+# 로그 스케일
+for c in ["WEB_HCP_Search","WEB_Consumer_Search","WEB_Display","WEB_Social","WEB_Direct","WEB_Referral"]:
+    web_wide[f"{c}_log"] = np.log1p(web_wide[c])
+
+# df_clean ←(year,month)→ web 머지
+# ⚠ 모델엔 HCP/Consumer 개별만 사용 (합계는 제외해 중복 방지)
+web_cols = [c for c in web_wide.columns
+            if c.endswith("_log") and (c.startswith("WEB_HCP_") or c.startswith("WEB_Consumer_"))]
+
+df = df.merge(web_wide[["year","month"]+web_cols], on=["year","month"], how="left").fillna(0)
+
+# ===================== 4) 대표 전술(액션 변수) =====================
+REP_FEATURES = [
+    "HCP Conference Email Open",
+    "HCP Display Endemic  Impression",
+    "HCP Display Programmatic  Impression",
+    "HCP Search SEM  Click",
+    "HCP SF Detailing  Detail",
+    "HCP SF Suggestion Email  Open",
+    "HCP Social  Impression",
+    "HCP Custom Programs  Click",
+    "Tactic Name Not Assigned Impression",
+    "CRM Email Open (Any)",
+]
+REP_FEATURES = [c for c in REP_FEATURES if c in df.columns]
+
+# ===================== 5) 타입 통일 =====================
+df["month"] = df["month"].astype("Int64").astype(str)
+df["Vendor"] = df["Vendor"].astype("string").fillna("missing")
+df["HCP Specialty"] = df["HCP Specialty"].astype("string")
+
+# ===================== 6) 모델 입력 =====================
+TARGET   = "y_log"
+CAT_COLS = ["HCP Specialty","Vendor","month"]
+NUM_COLS = ["year"] + web_cols + REP_FEATURES
+X = df[CAT_COLS + NUM_COLS].copy()
+y = df[TARGET].copy()
+
+# ===================== 7) 전처리 + 모델 =====================
+cat_pipe = Pipeline([
+    ("imp", SimpleImputer(strategy="most_frequent")),
+    ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+preprocess = ColumnTransformer([
+    ("cat", cat_pipe, CAT_COLS),
+    ("num", SimpleImputer(strategy="constant", fill_value=0.0), NUM_COLS)
+])
+hgb = HistGradientBoostingRegressor(
+    random_state=RANDOM_STATE, early_stopping=True,
+    validation_fraction=0.2, n_iter_no_change=20,
+    max_depth=5, max_iter=400, learning_rate=0.12,
+    min_samples_leaf=20, max_bins=128
+)
+model = Pipeline([("prep", preprocess), ("hgb", hgb)])
+
+# ===================== 8) Holdout & CV =====================
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
+model.fit(X_train, y_train)
+y_pred = model.predict(X_test)
+print("\n=== Holdout 80:20 ===")
+print(f"R²:   {r2_score(y_test, y_pred):.3f}")
+print(f"RMSE: {np.sqrt(mean_squared_error(y_test, y_pred)):.3f}")
+
+rmse_scorer = make_scorer(lambda yt, yp: np.sqrt(mean_squared_error(yt, yp)), greater_is_better=False)
+cv = cross_validate(model, X, y, cv=KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE),
+                    scoring={"r2":"r2","rmse":rmse_scorer})
+print("\n=== KFold (5-fold) ===")
+print(f"R²:   {cv['test_r2'].mean():.3f} ± {cv['test_r2'].std():.3f}")
+print(f"RMSE: {(-cv['test_rmse']).mean():.3f} ± {(-cv['test_rmse']).std():.3f}")
+
+# ===================== 9) 피처명 & 행렬 =====================
+prep = model.named_steps["prep"]
+ohe  = prep.named_transformers_["cat"].named_steps["ohe"]
+cat_features = ohe.get_feature_names_out(CAT_COLS)
+num_features = np.array(NUM_COLS, dtype=object)
+feat_names   = np.concatenate([cat_features, num_features])
+Xt_full      = prep.transform(X)
+est          = model.named_steps["hgb"]
+
+# ===================== 10) SHAP (빠른 샘플) 또는 Permutation 대체 =====================
+try:
+    explainer   = shap.Explainer(est, Xt_full)
+    n_sample    = min(500, Xt_full.shape[0])
+    shap_values = explainer(Xt_full[:n_sample]).values  # (n, p)
+    mean_abs    = np.mean(np.abs(shap_values), axis=0)
+except Exception as e:
+    print("[INFO] SHAP 실패, permutation_importance로 대체:", e)
+    perm = permutation_importance(est, Xt_full, y, n_repeats=10, random_state=RANDOM_STATE)
+    mean_abs = np.abs(perm.importances_mean)
+
+# ===================== 11) 그룹핑(웹 HCP/Consumer 분리) =====================
+CHANNEL_KEYS = ["Display","Programmatic","Social","SEM","Detail","CRM","Email","Custom Programs","Suggestion"]
+def assign_group(name: str) -> str:
+    s = str(name)
+    if s.startswith("Vendor_") or "Vendor=" in s: return "Vendor"
+    if s.startswith("HCP Specialty_") or "HCP Specialty=" in s: return "Specialty"
+    if s.startswith("cat__month_") or s == "year": return "Control"
+    if "WEB_HCP_" in s: return "Web_HCP"
+    if "WEB_Consumer_" in s: return "Web_Consumer"
+    if any(k in s for k in CHANNEL_KEYS): return "Tactic"
+    return "Other"
+
+shap_df = (pd.DataFrame({"feature": feat_names, "mean_abs_shap": mean_abs})
+             .assign(group=lambda d: d["feature"].apply(assign_group)))
+
+grp = (shap_df.groupby("group", as_index=False)["mean_abs_shap"].sum()
+               .assign(share_pct=lambda d: 100*d["mean_abs_shap"]/d["mean_abs_shap"].sum())
+               .sort_values("share_pct", ascending=False))
+
+print("\n=== Contribution share by group (Web_HCP vs Web_Consumer 분리) ===")
+print(grp)
+
+# ===================== 12) PPT용 워터폴 표 (Control → Tactic → Web_HCP → Web_Consumer → Total) =====================
+def pct_of(d, label):
+    return float(d.loc[d["group"].eq(label), "share_pct"].sum()) if label in set(d["group"]) else 0.0
+
+control_pct      = pct_of(grp, "Control") + pct_of(grp, "Vendor") + pct_of(grp, "Specialty")
+tactic_pct       = pct_of(grp, "Tactic")
+web_hcp_pct      = pct_of(grp, "Web_HCP")
+web_consumer_pct = pct_of(grp, "Web_Consumer")
+
+waterfall = pd.DataFrame({
+    "Category": ["Control (Baseline)","Tactic","Web (HCP)","Web (Consumer)","Total"],
+    "Value":    [round(control_pct,1), round(tactic_pct,1), round(web_hcp_pct,1), round(web_consumer_pct,1), 100.0]
+})
+
+print("\n=== Waterfall table (copy to PowerPoint) ===")
+print(waterfall.to_string(index=False))
+
+# (원하면 CSV로 저장)
+# waterfall.to_csv("waterfall_table.csv", index=False, encoding="utf-8-sig")
+# grp.to_csv("group_contribution_split_web.csv", index=False, encoding="utf-8-sig")
+
+
+
+N = 100  # 원하는 상위 개수
+
+# SHAP 계산 (있으면 재활용)
+try:
+    expl = shap.Explainer(est, Xt_full)
+    n_sample = min(1000, Xt_full.shape[0])
+    sv = expl(Xt_full[:n_sample]).values  # (n, p)
+    mean_abs = np.mean(np.abs(sv), axis=0)
+    mean_dir = np.mean(sv, axis=0)  # 방향(+/−) 참고용
+except Exception as e:
+    # fallback: permutation importance
+    from sklearn.inspection import permutation_importance
+    print("[INFO] SHAP failed; using permutation importance. Cause:", e)
+    importances = permutation_importance(est, Xt_full, np.ravel(model.named_steps['prep'].transform(df[['y_log']]) if False else None), n_repeats=10, random_state=42)
+    mean_abs = np.abs(importances.importances_mean)
+    mean_dir = importances.importances_mean
+
+top_df = (pd.DataFrame({
+            "feature": feat_names,
+            "mean_abs_shap": mean_abs,
+            "mean_shap": mean_dir
+         })
+         .sort_values("mean_abs_shap", ascending=False)
+         .head(N)
+         .reset_index(drop=True))
+
+# 보기 좋게 소수점 정리
+top_df["mean_abs_shap"] = top_df["mean_abs_shap"].round(6)
+top_df["mean_shap"] = top_df["mean_shap"].round(6)
+
+print(f"\n=== All features by |SHAP| ===")
+print(top_df.to_string(index=False))
+
+# 필요하면 CSV 저장
+# top_df.to_csv("top_features_by_shap.csv", index=False, encoding="utf-8-sig")
+
+### Pair Interaction to see channel impact
+# ==== SHAP Interaction tables (Specialty×Channel, Vendor×Channel, Other) ====
+import numpy as np, pandas as pd, shap
+
+# 0) 이름을 cat__/num__ 형태로 통일(보기용)
+feat_names_cat = np.array(["cat__"+f for f in cat_features], dtype=object)
+feat_names_num = np.array(["num__"+f for f in num_features], dtype=object)
+feat_names_full = np.concatenate([feat_names_cat, feat_names_num])
+
+# 1) 상호작용값 계산 (TreeExplainer)
+n_sample = min(500, Xt_full.shape[0])
+tree_expl = shap.TreeExplainer(est)
+inter = tree_expl.shap_interaction_values(Xt_full[:n_sample])
+if isinstance(inter, list):  # multi-output guard
+    inter = inter[0]
+
+# 2) 평균(|.|) / 평균(부호) 집계 → 페어 테이블
+abs_mean = np.mean(np.abs(inter), axis=0)
+sign_mean = np.mean(inter, axis=0)
+rows = []
+M = abs_mean.shape[0]
+for i in range(M):
+    for j in range(i+1, M):
+        rows.append((feat_names_full[i], feat_names_full[j],
+                     abs_mean[i, j], sign_mean[i, j]))
+pair_df = pd.DataFrame(rows, columns=[
+    "feature1","feature2","mean_abs_interaction","mean_interaction"
+]).sort_values("mean_abs_interaction", ascending=False)
+
+# 3) 그룹 라벨 (채널=전술)
+CHANNEL_KEYS = ["Display","Programmatic","Social","SEM","Detail","CRM","Email",
+                "Custom Programs","Suggestion","Endemic","Programmatic"]
+def assign_group_disp(name:str)->str:
+    s = str(name)
+    if s.startswith("cat__HCP Specialty"):  return "Specialty"
+    if s.startswith("cat__Vendor"):         return "Vendor"
+    if s.startswith("num__WEB_HCP_"):       return "Web_HCP"
+    if s.startswith("num__WEB_Consumer_"):  return "Web_Consumer"
+    if s.startswith("num__year") or "cat__month_" in s: return "Control"
+    if any(k in s for k in CHANNEL_KEYS):   return "Tactic"
+    return "Other"
+
+pair_df["g1"] = pair_df["feature1"].apply(assign_group_disp)
+pair_df["g2"] = pair_df["feature2"].apply(assign_group_disp)
+
+# 4) 헬퍼: 특정 그룹 간 페어 TopN
+def pick_pair(df, left_group, right_group, topn=20):
+    mask = ((df["g1"]==left_group) & (df["g2"]==right_group)) | \
+           ((df["g1"]==right_group) & (df["g2"]==left_group))
+    out = df.loc[mask, ["feature1","feature2","mean_abs_interaction","mean_interaction"]].copy()
+    return out.sort_values("mean_abs_interaction", ascending=False).head(topn)
+
+top_spec_channel  = pick_pair(pair_df, "Specialty", "Tactic", topn=20)
+top_vendor_channel= pick_pair(pair_df, "Vendor",    "Tactic", topn=20)
+
+# 5) 'Other' = 위 두 표에 포함되지 않은 상위 페어
+used = pd.concat([top_spec_channel, top_vendor_channel])
+other_df = pair_df.merge(used, how="left", indicator=True)
+top_other = other_df[other_df["_merge"]=="left_only"]\
+    .drop(columns=["_merge"])\
+    .sort_values("mean_abs_interaction", ascending=False)\
+    .head(20)[["feature1","feature2","mean_abs_interaction","mean_interaction"]]
+
+print("\n=== Top 20 Specialty×Channel ===")
+print(top_spec_channel.to_string(index=False))
+print("\n=== Top 20 Vendor×Channel ===")
+print(top_vendor_channel.to_string(index=False))
+print("\n=== Top 20 Other ===")
+print(top_other.to_string(index=False))
+
